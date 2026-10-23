@@ -5,8 +5,8 @@
 
 功能：
   1. 上传文字版（text-based）PDF 财报
-  2. 调用 DeepSeek API 提取：营业收入、归母净利润、净资产、总股本
-  3. 自动识别港股财报常见单位（HK$ million / 百万、千元 / HK$ thousand、亿元；亿股 / 万股 / 股），统一换算为「港元 / 股」
+  2. 调用 DeepSeek API 提取：营业收入、归母净利润、净资产、总股本（另提取人民币面值股本，仅参考）
+  3. 自动识别港股财报常见单位（HK$ million / 百万、千元 / HK$ thousand、亿元；百万股 / 亿股 / 万股 / 股），统一换算为「港元 / 股」
   4. 严格「先判断、再除法」，绝不输出负数估值：
        - 归母净利润 > 0 才计算 PE，否则 PE = None
        - 净资产      > 0 才计算 PB，否则 PB = None
@@ -64,7 +64,8 @@ CURRENCY_FACTORS = [
     ("hk$", 1.0),
 ]
 # 股本单位 -> 换算到「股」的系数
-SHARE_FACTORS = [("亿股", 1e8), ("万股", 1e4), ("股", 1.0)]
+# 注意：按「从大到小」排列，「百万股」必须在「万股」之前，否则「百万股」会被误匹配成「万股」。
+SHARE_FACTORS = [("亿股", 1e8), ("百万股", 1e6), ("万股", 1e4), ("股", 1.0)]
 
 
 def to_float(x):
@@ -164,6 +165,7 @@ SYSTEM_PROMPT = (
     "只能从用户提供的财报文本中提取数据，严禁编造或猜测，找不到的字段数值填 null。"
     "每个金额/股本字段必须同时返回「数值」和「单位」两个键（原始数值 + 原始单位），"
     "严禁只返回裸数字；单位必须照抄财报原文，识别不清就照抄原文。"
+    "「总股本」是已发行总股数（股数口径），「股本面值」是人民币计价的面值金额，两者必须分开提取、分别标注单位，严禁混淆。"
     "严格输出 JSON，不要输出 JSON 以外的任何文字。"
 )
 
@@ -177,8 +179,13 @@ def build_extraction_prompt(text):
         "3. 营业收入（必须同时返回【原始数值】和【原始单位】）\n"
         "4. 归母净利润（归属于母公司股东的净利润，必须同时返回【原始数值】和【原始单位】）\n"
         "5. 净资产（归属于母公司股东的净资产 / 股东权益，必须同时返回【原始数值】和【原始单位】）\n"
-        "6. 总股本（如 亿股 / 万股 / 股，必须同时返回【原始数值】和【原始单位】）\n\n"
-        "【原始单位】必须如实照抄财报里的写法，例如：HK$ million、HK$ thousand、百万、千元、亿元、万、港元、亿股、万股、股。\n"
+        "6. 总股本（已发行总股数，股数口径，不是面值/金额。单位务必区分：百万股 / 亿股 / 万股 / 股，"
+        "必须同时返回【原始数值】和【原始单位】。提示：腾讯等公司年报常把总股数写在「财务附注」「股本变动表/权益变动表」里，"
+        "不在利润表或资产负债表主表，务必去这些位置查找并提取）\n"
+        "7. 股本面值（人民币面值口径，如有）：原文若披露以人民币计价的股本面值（例如「股本 9.5亿元」），"
+        "单独提取并标注单位，仅作参考，严禁与第 6 项总股本（股数）混淆；找不到则数值填 null、单位填 null）\n\n"
+        "【原始单位】必须如实照抄财报里的写法，例如：HK$ million、HK$ thousand、百万、千元、亿元、万、港元、"
+        "百万股、亿股、万股、股。\n"
         "严禁只返回裸数字：每个金额/股本字段都必须带「数值」和「单位」两个键；单位识别不清就照抄原文，不要自己改写。\n"
         "找不到的字段数值填 null、单位填 null。\n\n"
         "严格按以下 JSON 结构输出（仅输出 JSON，不要任何多余文字）：\n"
@@ -186,7 +193,8 @@ def build_extraction_prompt(text):
         '"营业收入":{"数值":123.45,"单位":"百万"},'
         '"归母净利润":{"数值":12.34,"单位":"HK$ million"},'
         '"净资产":{"数值":100.0,"单位":"亿元"},'
-        '"总股本":{"数值":50.0,"单位":"亿股"}}\n\n'
+        '"总股本":{"数值":50.0,"单位":"亿股"},'
+        '"股本面值":{"数值":9.5,"单位":"亿元"}}\n\n'
         "财报文本：\n" + snippet
     )
 
@@ -304,8 +312,8 @@ def fmt_export(value, decimals=2):
 
 
 # ------------------------- 结果表格 -------------------------
-def build_financial_df(conv):
-    """① 关键财务数据提取表。conv: {字段名: convert_to_base 返回的 dict}。"""
+def build_financial_df(conv, raw=None):
+    """① 关键财务数据提取表。conv: {字段名: convert_to_base 返回的 dict}；raw: 模型原始 JSON（用于展示面值等参考字段）。"""
     def row(name, kind):
         c = conv.get(name, {})
         raw_value = c.get("raw_value")
@@ -330,6 +338,14 @@ def build_financial_df(conv):
         row("净资产", "currency"),
         row("总股本", "shares"),
     ]
+    # 股本面值（人民币面值口径）：仅参考展示，不换算、不参与估值
+    face_value, face_unit = extract_field(raw or {}, "股本面值")
+    if face_value is not None or face_unit is not None:
+        rows.append(["股本面值(人民币·仅参考)",
+                     fmt_export(face_value, 2),
+                     fmt_export(face_unit),
+                     "--",
+                     "仅参考，不参与估值"])
     return pd.DataFrame(rows, columns=["项目", "原数值", "原单位", "换算后(港元/股)", "可读显示"])
 
 
@@ -378,17 +394,27 @@ def df_to_markdown(df):
     return "\n".join(lines)
 
 
-def export_excel(name, fin_df, val_df):
+def _fin_df_with_manual(fin_df, manual_total_shares):
+    """给财务数据表追加一行「手动填入总股本（亿股）」，仅用于导出，不改动展示表。"""
+    fin_export = fin_df.copy()
+    manual_val = to_float(manual_total_shares)
+    fin_export.loc[len(fin_export)] = ["手动填入总股本（亿股）",
+                                       fmt_export(manual_val, 2),
+                                       "亿股", "--", "兜底输入，仅用于后台估值"]
+    return fin_export
+
+
+def export_excel(name, fin_df, val_df, manual_total_shares=None):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(OUTPUT_DIR, f"{_safe_name(name)}_估值_{ts}.xlsx")
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        fin_df.to_excel(writer, sheet_name="财务数据", index=False)
+        _fin_df_with_manual(fin_df, manual_total_shares).to_excel(writer, sheet_name="财务数据", index=False)
         val_df.to_excel(writer, sheet_name="估值结果", index=False)
     return path
 
 
-def export_markdown(name, raw, price, fin_df, val_df):
+def export_markdown(name, raw, price, fin_df, val_df, manual_total_shares=None):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(OUTPUT_DIR, f"{_safe_name(name)}_估值备忘_{ts}.md")
@@ -401,7 +427,7 @@ def export_markdown(name, raw, price, fin_df, val_df):
         f"- 最新股价：{price if price is not None else '-'}",
         "",
         "## 关键财务数据",
-        df_to_markdown(fin_df),
+        df_to_markdown(_fin_df_with_manual(fin_df, manual_total_shares)),
         "",
         "## 估值结果",
         df_to_markdown(val_df),
@@ -419,7 +445,7 @@ def export_markdown(name, raw, price, fin_df, val_df):
 
 
 # ------------------------- 主流程回调 -------------------------
-def run_analysis(pdf_file, name, price):
+def run_analysis(pdf_file, name, price, manual_total_shares=None):
     """按钮回调：PDF 读取 -> DeepSeek 提取 -> 单位换算 -> 估值 -> 导出。"""
     # 1) 读 PDF
     try:
@@ -446,19 +472,33 @@ def run_analysis(pdf_file, name, price):
     revenue = conv["营业收入"]["value"]
     net_profit = conv["归母净利润"]["value"]
     equity = conv["净资产"]["value"]
-    shares = conv["总股本"]["value"]
+    # 总股本选择：AI 提取优先；AI 无效时回退手动填入（亿股 -> 股）；两者都无效则不计算市值
+    ai_shares = conv["总股本"]["value"]
+    manual_shares = None
+    m = to_float(manual_total_shares)
+    if m is not None and m > 0:
+        manual_shares = m * 1e8  # 亿股 -> 股
+    if ai_shares is not None and ai_shares > 0:
+        shares = ai_shares
+        print(f"[日志] 采用 AI 提取总股本：{shares:,.0f} 股")
+    elif manual_shares is not None:
+        shares = manual_shares
+        print(f"[日志] AI 总股本无效，回退使用手动填入总股本：{shares:,.0f} 股")
+    else:
+        shares = None
+        print("[警告] AI 与手动总股本均无效，总市值/PE/PB/PS 不计算")
     unknown_fields = [name for name, c in conv.items() if c.get("unit_unknown")]
     if unknown_fields:
         print(f"[警告] 存在 unit_unknown 字段：{unknown_fields}，对应估值将不计算")
     # 5) 估值
     result = compute_valuations(revenue, net_profit, equity, shares, to_float(price))
     # 6) 建表 / 绘图 / 导出
-    fin_df = build_financial_df(conv)
+    fin_df = build_financial_df(conv, raw)
     val_df = build_valuation_df(result)
     fig = build_plot(result["PE"], result["PB"], result["PS"])
     try:
-        excel_path = export_excel(name, fin_df, val_df)
-        md_path = export_markdown(name, raw, to_float(price), fin_df, val_df)
+        excel_path = export_excel(name, fin_df, val_df, manual_total_shares)
+        md_path = export_markdown(name, raw, to_float(price), fin_df, val_df, manual_total_shares)
     except Exception as e:
         raise gr.Error(f"❌ 导出文件失败：{e}")
     return fin_df, val_df, fig, excel_path, md_path
@@ -478,6 +518,9 @@ def build_ui():
                 name = gr.Textbox(label="② 股票名称 / 代码（可选，用于导出文件名）",
                                   placeholder="例如：腾讯控股 00700.HK")
                 price = gr.Number(label="③ 最新股价（港元/股）", precision=3)
+                manual_total_shares = gr.Number(label="总股本（亿股，可选）",
+                                                placeholder="AI自动提取优先，提取失败可手动填入",
+                                                value=None)
                 btn = gr.Button("开始解析并估值", variant="primary")
             with gr.Column(scale=2):
                 fin_table = gr.Dataframe(label="关键财务数据（已统一换算为港元）", wrap=True)
@@ -487,7 +530,7 @@ def build_ui():
                     excel_out = gr.File(label="下载 Excel")
                     md_out = gr.File(label="下载 Markdown 备忘")
 
-        btn.click(fn=run_analysis, inputs=[pdf_file, name, price],
+        btn.click(fn=run_analysis, inputs=[pdf_file, name, price, manual_total_shares],
                   outputs=[fin_table, val_table, plot, excel_out, md_out])
     return demo
 

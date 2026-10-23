@@ -1,0 +1,6 @@
+gradio
+pdfplumber
+pandas
+python-dotenv
+plotly
+openpyxl  # pandas 导出 Excel 所需（to_excel 引擎）
